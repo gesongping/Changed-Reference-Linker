@@ -1,35 +1,30 @@
 # Changed Reference Linker
 
-A modified edition of [Zotero Reference Linker](https://github.com/ottersem/zotero-reference-linker), maintained by **gesongping**.
+A Zotero PDF reference-linking plugin maintained by **gesongping**. Based on [Zotero Reference Linker](https://github.com/ottersem/zotero-reference-linker) by **ottersem (Seungmin Park)**. This is an independent derivative, not an official release of the original plugin.
 
-**Original project:** [ottersem/zotero-reference-linker](https://github.com/ottersem/zotero-reference-linker), created by **ottersem (Seungmin Park)**. Many thanks for the original implementation. This fork is an independent derivative and is not an official release of the original project.
+## Features (v1.2.0)
 
-The original project is released under the **MIT License**. Its original copyright notice (`Copyright (c) 2026 Seungmin Park`) and the complete license terms are preserved in [LICENSE](LICENSE). The modifications are also distributed under the MIT License.
-
-## Features
-
-- Recognizes numbered and author–year bibliographies in PDF documents.
-- Highlights complete reference entries, including references continued across pages, while avoiding detected page headers and footers.
-- Uses subtle light gray for references without a confident library match and light yellow for those matched to Zotero items.
-- Opens linked library items or PDFs and provides search/copy actions for references without matches.
-- Matches Zotero library metadata with conservative title/author/year checks, across accessible libraries.
-- Displays **扫描 / 匹配 / 模糊** (scanned / matched / ambiguous) counters inline on the PDF toolbar. Click **Ref** to refresh.
+- Finds reference sections with common headings such as `References`, numbered `9. REFERENCES`, and `Bibliography`, with fallback detection when a heading is absent.
+- Recognizes numbered labels (`[1]`, `(1)`, `1.`), alphanumeric labels (`[BGV14]`, `[ACC⁺21]`), and unnumbered author–year bibliographies.
+- Highlights full reference entries using a shared boundary index, including entries that continue across pages.
+- Filters detected running headers, footers, and standalone page numbers to reduce accidental highlighting.
+- Keeps publication-year suffixes, `[Online]` information, URLs, and DOIs inside the reference highlight when they are part of the entry.
+- Matches references against Zotero library items, supports opening matched items, and provides search/copy options for unmatched items.
+- Displays scanned / matched / ambiguous counts in the PDF reader toolbar.
 
 ## Install
 
-Requires **Zotero 10.0.x** (verified by the maintainer's testing on Zotero 10.0.7; compatibility outside that line is not established).
+Requires **Zotero 10.0.x** as specified in the plugin manifest. Other Zotero versions have not been verified.
 
-1. Download `Changed-Reference-Linker-1.0.0.xpi` from this repository's Releases.
-2. In Zotero choose **Tools → Plugins → gear menu → Install Plugin From File**.
-3. Restart Zotero if requested.
+1. Download [`Changed-Reference-Linker-1.2.0.xpi`](https://github.com/gesongping/Changed-Reference-Linker/releases/download/v1.2.0/Changed-Reference-Linker-1.2.0.xpi) from the **v1.2.0** release.
+2. In Zotero, open **Tools → Plugins**, then use the gear menu to select **Install Plugin From File**.
+3. Choose the downloaded `.xpi` and restart Zotero if prompted.
 
 
 ## Acknowledgments
 
-Changed Reference Linker is a modified and enhanced version of [Reference Linker](https://github.com/ottersem/zotero-reference-linker), originally developed by **Seungmin Park (ottersem)**.
-
-We sincerely thank the original author for making the project publicly available under the MIT License. The original copyright notice and license terms are retained in the [LICENSE](LICENSE) file.
+This repository is a modified and enhanced version of [Reference Linker](https://github.com/ottersem/zotero-reference-linker), originally developed by **Seungmin Park (ottersem)**. Many thanks to the original author. The original MIT copyright notice is preserved in `LICENSE`.
 
 ## License
 
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
+MIT License. See [`LICENSE`](LICENSE).

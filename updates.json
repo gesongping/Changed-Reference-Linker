@@ -1,0 +1,19 @@
+{
+  "addons": {
+    "changed-reference-linker@gesongping.github.io": {
+      "updates": [
+        {
+          "version": "1.2.0",
+          "update_link": "https://github.com/gesongping/Changed-Reference-Linker/releases/download/v1.2.0/Changed-Reference-Linker-1.2.0.xpi",
+          "update_hash": "sha256:e33f277dcb0a96327d6e2ed0999311d73fc8a14f160c7981bdb065fe282514b4",
+          "applications": {
+            "zotero": {
+              "strict_min_version": "10.0",
+              "strict_max_version": "10.0.*"
+            }
+          }
+        }
+      ]
+    }
+  }
+}

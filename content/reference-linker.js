@@ -126,8 +126,13 @@ class ReaderIntegration {
     async scan(reader, reportEmpty, force = false) {
         const state = this.states.get(reader);
         const doc = this.getViewerDocument(reader);
-        if (!state || !doc || state.scanning)
-            return undefined;
+        if (!state || !doc) return undefined;
+        if (state.scanning) {
+            // Text layers can arrive while an asynchronous scan is running.
+            // Never discard that redraw request.
+            state.pendingRescan = true;
+            return state.lastMatched;
+        }
         this.observeViewer(reader, doc);
         const fingerprint = this.pageFingerprint(doc);
         if (!force && state.fingerprint === fingerprint)
@@ -166,12 +171,14 @@ class ReaderIntegration {
             };
             if (!state.overlay || state.overlayDocument !== doc) {
                 state.overlay?.destroy();
-                state.overlay = new ReferenceOverlay_1.ReferenceOverlay(doc, match => void this.open(match.record.item.id, match.record.pdfAttachmentID), url => this.zotero.launchURL(url));
+                state.overlay = new ReferenceOverlay_1.ReferenceOverlay(doc, match => void this.openPDF(match.record.pdfAttachmentID));
                 state.overlayDocument = doc;
             }
             state.overlay.clear();
-            state.overlay.indexPages(section.startPage, section.endPage, section.startHeading, section.endHeading);
+            state.overlay.indexPages(section.startPage, section.endPage, section.startHeading,
+                section.endHeading, section.references[0]);
             state.overlay.prepareReferences(section.references);
+            state.missingTextPages = section.endPage - section.startPage + 1 - state.overlay.pages.length;
             let matchedItems = 0;
             let ambiguousItems = 0;
             let unmatchedItems = 0;
@@ -216,6 +223,7 @@ class ReaderIntegration {
                 state.overlay.renderReference(reference, position, match, referenceKey, citation);
             }
             const linked = state.overlay.linkCount();
+            state.missingRendered = Math.max(0, references.length - state.overlay.renderedCount());
             this.updateSummary(state, {
                 scanned: references.length,
                 matched: matchedItems,
@@ -223,7 +231,8 @@ class ReaderIntegration {
                 unmatched: unmatchedItems
             });
             const boundaryStats = state.overlay.boundarySummary();
-            this.zotero.debug(`Reference Linker: boundaries ${boundaryStats.resolved}/${references.length}, terminal=${boundaryStats.byTail}, next=${boundaryStats.byNext}; ${linked} links rendered; ${matchedItems} library items matched; source=${section.source}`);
+            const skipped = references.map((ref, i) => state.overlay.renderedReferences.has(ref.index == null ? `reference:${i}` : `index:${ref.index}`) ? null : ref.index ?? i + 1).filter(value => value != null);
+            this.zotero.debug(`Reference Linker: boundaries ${boundaryStats.resolved}/${references.length}, painted=${state.overlay.renderedCount()}, unpainted=${skipped.join(",") || "none"}; terminal=${boundaryStats.byTail}, next=${boundaryStats.byNext}; ${linked} PDF buttons; source=${section.source}`);
             state.lastMatched = linked;
             return linked;
         }
@@ -233,6 +242,10 @@ class ReaderIntegration {
         }
         finally {
             state.scanning = false;
+            if (state.pendingRescan) {
+                state.pendingRescan = false;
+                this.scheduleScan(reader, 300);
+            }
         }
     }
     getReferenceSection(reader, state) {
@@ -311,8 +324,9 @@ class ReaderIntegration {
         return Array.from(doc.querySelectorAll(".page")).map(page => {
             const spans = page.querySelectorAll(".textLayer span");
             const first = spans.item(0)?.textContent || "";
+            const middle = spans.item(Math.floor(spans.length / 2))?.textContent || "";
             const last = spans.item(spans.length - 1)?.textContent || "";
-            return `${page.dataset.pageNumber || "?"}:${spans.length}:${first}:${last}`;
+            return `${page.dataset.pageNumber || "?"}:${spans.length}:${first}:${middle}:${last}`;
         }).join("|");
     }
     getPdfDocument(reader) {
@@ -347,37 +361,55 @@ class ReaderIntegration {
         state.viewerObserver?.disconnect();
         const Observer = win.MutationObserver;
         state.viewerObserver = new Observer(mutations => {
-            const changedReaderContent = mutations.some(mutation => Array.from(mutation.addedNodes).some(node => !this.isOwnNode(node))
-                || Array.from(mutation.removedNodes).some(node => !this.isOwnNode(node)));
-            if (changedReaderContent)
-                this.scheduleScan(reader);
+            const changedReaderContent = mutations.some(mutation => {
+                if (mutation.type === "characterData") return !this.isOwnNode(mutation.target);
+                return Array.from(mutation.addedNodes).some(node => !this.isOwnNode(node))
+                    || Array.from(mutation.removedNodes).some(node => !this.isOwnNode(node));
+            });
+            if (changedReaderContent) this.scheduleScan(reader, 260);
         });
-        state.viewerObserver.observe(doc.documentElement, { childList: true, subtree: true });
+        state.viewerObserver.observe(doc.documentElement, { childList: true, characterData: true, subtree: true });
+        // A viewer can create page text layers lazily on scrolling without
+        // changing its existing page elements. Recheck the fingerprint after
+        // navigating whenever bibliography pages were absent at last scan.
+        state.viewerScrollTarget?.removeEventListener("scroll", state.viewerScrollHandler, true);
+        state.viewerScrollTarget = doc;
+        state.viewerScrollHandler = () => {
+            if (state.missingTextPages > 0 || state.missingRendered > 0) {
+                // Some PDF.js versions reuse the same .page and span nodes when
+                // virtualizing text layers. Rescan after scrolling even if the
+                // coarse fingerprint remains unchanged.
+                state.fingerprint = undefined;
+                this.scheduleScan(reader, 450);
+            }
+        };
+        doc.addEventListener("scroll", state.viewerScrollHandler, true);
         state.viewerDocument = doc;
     }
     isOwnNode(node) {
-        if (node.nodeType !== 1)
-            return false;
-        const element = node;
-        return element.matches(".reference-linker-badge, .reference-linker-menu, #reference-linker-style")
-            || Boolean(element.closest(".reference-linker-badge, .reference-linker-menu"));
+        // A redraw inserts many highlight regions. Treat those changes (and
+        // their descendant text nodes) as ours; otherwise they trigger another
+        // scan, which triggers another redraw indefinitely.
+        const element = node.nodeType === 1 ? node : node.parentElement;
+        if (!element?.matches) return false;
+        const selector = ".reference-linker-region, .reference-linker-badge, #reference-linker-style";
+        return element.matches(selector) || Boolean(element.closest(selector));
     }
     getAttachment(reader) {
         const item = reader._item || (reader.itemID ? this.zotero.Items.get(reader.itemID) : false);
         return item && item.isAttachment() ? item : undefined;
     }
-    async open(itemID, pdfAttachmentID) {
-        if (pdfAttachmentID) {
+    async openPDF(pdfAttachmentID) {
+        // Only the explicit PDF badge can navigate. A library-item-only match
+        // remains highlighted but does not create an action or open an item.
+        if (pdfAttachmentID)
             await this.zotero.Reader.open(pdfAttachmentID);
-            return;
-        }
-        const pane = this.zotero.getMainWindow().ZoteroPane;
-        await pane?.selectItem(itemID);
     }
     destroyReader(reader) {
         const state = this.states.get(reader);
         state?.outerObserver?.disconnect();
         state?.viewerObserver?.disconnect();
+        state?.viewerScrollTarget?.removeEventListener("scroll", state.viewerScrollHandler, true);
         state?.overlay?.destroy();
         state?.summary?.remove();
         const win = reader._iframeWindow;
@@ -1138,6 +1170,45 @@ const REFERENCE_HEADING = /^\s*(?:(?:\d{1,4}|[A-ZIVX]{1,8})\s*[.):]\s*)?(?:refer
 const STOP_HEADING = /^\s*(?:\d{1,4}\s+)?(appendix|appendices|supplementary material|supplemental material|acknowledg(?:e)?ments?)(?:\s+\d{1,4})?\b/i;
 const ACKNOWLEDGEMENT_HEADING = /^\s*(?:\d{1,4}\s+)?acknowledg(?:e)?ments?(?:\s+\d{1,4})?\s*$/i;
 const LETTERED_STOP_HEADING = /^\s*A\.(?:\d+\.?\s+|\s*)(?=[\p{Lu}])[^,.;]{2,100}\s*$/u;
+// A bibliography can be followed by a lettered appendix without the word
+// "Appendix": "A The ReSkew cryptosystem". PDF.js may split the letter and
+// title into separate spans/lines. Recognize this as a SECTION boundary,
+// not as an ordinary author surname or publication year.
+function appendixTitleCandidate(text) {
+    const value = (text || "").replaceAll(CONTINUATION_LINE, "").trim();
+    if (!value || value.length > 115 || /(?:https?:|www\.|\b(?:18|19|20|21)\d{2}\b)/iu.test(value)) return false;
+    // Author initials ("E. Brickell ...") and editor lines often begin
+    // with a letter and a dot. Do not turn them into fake appendices.
+    if (/[.,;:!?]/u.test(value)) return false;
+    const words = value.match(/[\p{L}][\p{L}'’-]*/gu) || [];
+    return words.length >= 2 && words.length <= 16 && /^\p{Lu}/u.test(value);
+}
+function isBibliographyStopHeading(line, nextLine = "", followingLines = []) {
+    const current = (line || "").replaceAll(CONTINUATION_LINE, "").trim();
+    const next = (nextLine || "").replaceAll(CONTINUATION_LINE, "").trim();
+    // Explicit headings remain unambiguous, including "Appendix A" and "A. Title".
+    if (STOP_HEADING.test(current) || LETTERED_STOP_HEADING.test(current)) return true;
+    const inline = current.match(/^([A-H])(?:\s*[.)]\s*|\s+)(.+)$/u);
+    const unpunctuated = /^[A-H](?:\s+|$)/u.test(current);
+    const candidate = (inline && appendixTitleCandidate(inline[2])) ||
+        (/^[A-H]$/u.test(current) && appendixTitleCandidate(next));
+    if (!candidate) return false;
+    // A common running head is "A Privacy-Centric Approach  295", or the
+    // same title and page number in separate PDF.js spans.  Such a heading
+    // may appear on EVERY even bibliography page, immediately before "14. ...".
+    // Do not treat it as an appendix, even when a PDF text-layer omits the
+    // number or splits the title across several spans.
+    if (unpunctuated) {
+        const upcoming = [next, ...followingLines].map(value =>
+            (value || "").replaceAll(CONTINUATION_LINE, "").trim());
+        if (/\s\d{2,4}\s*$/u.test(current) ||
+            upcoming.slice(0, 4).some(value => /^\d{2,4}\s*$/u.test(value)) ||
+            upcoming.some(value => /^\d{1,4}\s*[.)](?=\s|$)/u.test(value)))
+            return false;
+    }
+    return true;
+}
+
 const LABELED_START = /(?:^|\n)\s*(?:\[\s*((?=[^\]\n]{0,28}\d)[\p{L}0-9][\p{L}0-9+⁺.:/_\-\s]{0,27})\s*\]|\(\s*(\d{1,4})\s*\)|((?!(?:18|19|20|21)\d{2}\b)\d{1,4})[.)]|((?!(?:18|19|20|21)\d{2}\b)\d{1,4})(?=\s+(?:[A-ZÀ-ÖØ-Þ](?:\.|\s)|Technical\b)))(?:\s+|(?=\p{Lu}))/gu;
 const PARTICLE = `(?:[Dd]e|[Dd]el|[Dd]en|[Dd]er|[Dd]i|[Dd]u|[Ll]a|[Ll]e|[Vv]an|[Vv]on)\\s+`;
 const SURNAME = `(?:${PARTICLE}){0,3}[A-ZÀ-ÖØ-Þ][\\p{L}'’-]+(?:\\s+[A-ZÀ-ÖØ-Þ][\\p{L}'’-]+){0,2}`;
@@ -1175,6 +1246,7 @@ class PdfSectionExtractor {
         if (scanned) {
             const section = await this.extractRange(pdf, scanned.startPage, scanned.endPage, "heading-scan", scanned.startLine, scanned.endLine);
             section.startHeading = scanned.heading || "References";
+            if (scanned.endHeading) section.endHeading = scanned.endHeading;
             candidates.push(section);
         }
         // Headingless papers exist. Only attempt this expensive fallback when
@@ -1241,9 +1313,10 @@ class PdfSectionExtractor {
                     found = { startPage: pageIndex, startLine: startLine + 1, heading: this.visibleLine(lines[startLine]) };
                 continue;
             }
-            const stopLine = lines.findIndex(line => this.isStopHeading(line));
+            const stopLine = this.findStopHeadingLine(lines);
             if (stopLine >= 0)
-                return { ...found, endPage: pageIndex, endLine: stopLine };
+                return { ...found, endPage: pageIndex, endLine: stopLine,
+                    endHeading: this.stopHeadingText(lines, stopLine) };
         }
         return found ? { ...found, endPage: pdf.numPages - 1 } : undefined;
     }
@@ -1316,8 +1389,10 @@ class PdfSectionExtractor {
                 pages.push(lines.slice(0, reorderedAcknowledgement).join("\n"));
                 continue;
             }
-            const stopLine = lines.findIndex(line => this.isStopHeading(line));
+            const stopLine = this.findStopHeadingLine(lines);
             if (stopLine >= 0) {
+                const detectedHeading = this.stopHeadingText(lines, stopLine);
+                if (detectedHeading) endHeading = detectedHeading;
                 lines = lines.slice(0, stopLine);
                 detectedEndPage = pageIndex;
                 if (lines.length)
@@ -1328,15 +1403,28 @@ class PdfSectionExtractor {
             // entries. These often contain an isolated page number and title.
             pages.push(lines.join("\n"));
         }
-        return { startPage, endPage: detectedEndPage, references: this.splitReferences(pages.join("\n")), source };
+        return { startPage, endPage: detectedEndPage,
+            references: this.splitReferences(pages.join("\n")), source,
+            ...(endHeading ? { endHeading } : {}) };
     }
     sameHeading(a, b) {
         const normalize = (value) => value.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
         return normalize(this.visibleLine(a)) === normalize(this.visibleLine(b));
     }
-    isStopHeading(line) {
-        const visible = this.visibleLine(line);
-        return STOP_HEADING.test(visible) || LETTERED_STOP_HEADING.test(visible);
+    isStopHeading(line, nextLine = "", followingLines = []) {
+        return isBibliographyStopHeading(this.visibleLine(line), this.visibleLine(nextLine),
+            followingLines.map(value => this.visibleLine(value)));
+    }
+    findStopHeadingLine(lines) {
+        return lines.findIndex((line, index) => this.isStopHeading(line,
+            lines[index + 1] || "", lines.slice(index + 2, index + 7)));
+    }
+    stopHeadingText(lines, index) {
+        if (index < 0) return undefined;
+        const first = this.visibleLine(lines[index]).trim();
+        const next = this.visibleLine(lines[index + 1] || "").trim();
+        return /^[A-H]$/u.test(first) && appendixTitleCandidate(next)
+            ? `${first} ${next}` : first;
     }
     visibleLine(line) {
         let visible = line.replaceAll(CONTINUATION_LINE, "");
@@ -1627,33 +1715,14 @@ class PdfSectionExtractor {
     }
 }
 exports.PdfSectionExtractor = PdfSectionExtractor;
+exports.isBibliographyStopHeading = isBibliographyStopHeading;
 
 };
 modules["src/reader/ReferenceOverlay.ts"]=function(module,exports,require){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.ReferenceOverlay = void 0;
-exports.unmatchedReferenceActions = unmatchedReferenceActions;
-exports.findIndexedReferenceMarkers = findIndexedReferenceMarkers;
-function unmatchedReferenceActions(citation) {
-    const actions = [];
-    if (citation.doi)
-        actions.push({ kind: "open", label: "Open DOI", value: `https://doi.org/${citation.doi}` });
-    const searchText = citation.title || citation.raw.trim();
-    if (searchText) {
-        actions.push({
-            kind: "open",
-            label: "Search",
-            value: `https://scholar.google.com/scholar?q=${encodeURIComponent(searchText)}`
-        });
-        actions.push({
-            kind: "copy",
-            label: citation.title ? "Copy title" : "Copy reference",
-            value: searchText
-        });
-    }
-    return actions;
-}
+const PdfSectionExtractor_1 = require("../core/PdfSectionExtractor");
 function findIndexedReferenceMarkers(text) {
     // Prefer explicit bracketed citation labels when the document uses them.
     // A previous mixed regex could read "art. no. 13." as an index 13 marker,
@@ -1800,7 +1869,13 @@ class ReferenceBoundaryIndex {
             const tail = this.locateTail(references[position], start, next);
             // Without a verified tail or next marker, do not guess page end.
             // The existing per-style matchers can act as a conservative fallback.
-            const end = tail || next;
+            let end = tail || next;
+            if (!end && position === references.length - 1) {
+                const last = this.pages.at(-1);
+                if (last && last.pageIndex === start.pageIndex && last.searchableEnd > start.offset) {
+                    end = { pageIndex: last.pageIndex, offset: last.searchableEnd };
+                }
+            }
             if (!end || end.pageIndex - start.pageIndex > 3) continue;
             const fragments = this.fragmentsBetween(start, end);
             if (!fragments.length) continue;
@@ -1813,55 +1888,20 @@ class ReferenceBoundaryIndex {
 class ReferenceOverlay {
     doc;
     onOpen;
-    onOpenURL;
-    onCopyText;
     static styleID = "reference-linker-style";
     pages = [];
     boundaries;
-    hits = new WeakMap();
-    unmatched = new WeakMap();
     renderedReferences = new Set();
     pageFurniture = new WeakMap();
-    menu;
-    clickHandler = (event) => {
-        const target = event.target instanceof this.doc.defaultView.Element ? event.target : null;
-        if (target?.closest(".reference-linker-menu"))
-            return;
-        const hit = target?.closest(".reference-linker-hit");
-        const match = hit ? this.hits.get(hit) : undefined;
-        if (match) {
-            event.preventDefault();
-            event.stopPropagation();
-            this.closeMenu();
-            this.onOpen(match);
-            return;
-        }
-        const unmatched = target?.closest(".reference-linker-unmatched");
-        const citation = unmatched ? this.unmatched.get(unmatched) : undefined;
-        if (!unmatched || !citation || !unmatchedReferenceActions(citation).length) {
-            this.closeMenu();
-            return;
-        }
-        event.preventDefault();
-        event.stopPropagation();
-        this.showMenu(unmatched, citation);
-    };
-    constructor(doc, onOpen, onOpenURL = url => { doc.defaultView?.open(url, "_blank", "noopener"); }, onCopyText) {
+    constructor(doc, onOpen) {
         this.doc = doc;
         this.onOpen = onOpen;
-        this.onOpenURL = onOpenURL;
-        this.onCopyText = onCopyText;
         this.installStyle();
-        this.doc.addEventListener("click", this.clickHandler, true);
+        // Deliberately no document-level click handler: all highlight regions
+        // are passive, and only a matched PDF badge has an onClick action.
     }
     clear() {
-        this.doc.querySelectorAll(".reference-linker-hit, .reference-linker-unmatched, .reference-linker-actionable").forEach(node => {
-            node.classList.remove("reference-linker-hit", "reference-linker-unmatched", "reference-linker-actionable");
-        });
         this.doc.querySelectorAll(".reference-linker-badge, .reference-linker-region").forEach(node => node.remove());
-        this.closeMenu();
-        this.hits = new WeakMap();
-        this.unmatched = new WeakMap();
         this.renderedReferences.clear();
         this.pageFurniture = new WeakMap();
         this.boundaries = undefined;
@@ -2000,17 +2040,12 @@ class ReferenceOverlay {
                     || (runningFooter && isBottom))
                     continue;
                 const region = this.doc.createElement("div");
+                // Colors convey match state only; the region never handles clicks.
                 region.className = `reference-linker-region ${match ? "reference-linker-hit" : "reference-linker-unmatched"}`;
-                if (!match && citation && unmatchedReferenceActions(citation).length)
-                    region.classList.add("reference-linker-actionable");
                 region.style.left = `${rect.left - pageRect.left}px`;
                 region.style.top = `${rect.top - pageRect.top}px`;
                 region.style.width = `${rect.width}px`;
                 region.style.height = `${rect.height}px`;
-                if (match)
-                    this.hits.set(region, match);
-                else if (citation)
-                    this.unmatched.set(region, citation);
                 fragmentPage.append(region);
                 lastRect = rect;
                 paintedPage = fragmentPage;
@@ -2020,14 +2055,15 @@ class ReferenceOverlay {
         if (!painted)
             return false;
         this.renderedReferences.add(referenceKey);
-        if (!match || !lastRect || !paintedPage)
+        // Matched records with no attached PDF have no clickable control.
+        if (!match?.record.pdfAttachmentID || !lastRect || !paintedPage)
             return true;
         const page = paintedPage;
         const pageRect = page.getBoundingClientRect();
         const badge = this.doc.createElement("button");
         badge.className = "reference-linker-badge";
         badge.type = "button";
-        badge.textContent = match.record.pdfAttachmentID ? "↗ PDF" : "↗ Item";
+        badge.textContent = "↗ PDF";
         badge.title = `${match.record.title}\nMatched by ${match.method}`;
         badge.style.left = `${Math.min(lastRect.right - pageRect.left + 6, pageRect.width - 54)}px`;
         badge.style.top = `${lastRect.top - pageRect.top}px`;
@@ -2060,7 +2096,7 @@ class ReferenceOverlay {
         const match = stop.exec(tail);
         return match ? start + match.index + (match[0].length - match[0].trimStart().length) : text.length;
     }
-    indexPages(startPage, endPage, startHeading, endHeading) {
+    indexPages(startPage, endPage, startHeading, endHeading, firstReference) {
         this.pages = [];
         const sectionText = [];
         for (const page of this.doc.querySelectorAll(".page")) {
@@ -2070,25 +2106,52 @@ class ReferenceOverlay {
             const spans = Array.from(page.querySelectorAll(".textLayer span"));
             if (!spans.length)
                 continue;
-            const joined = this.joinSpans(spans);
+            const joined = this.joinSpans(spans, page);
             let searchableStart = 0;
             let searchableEnd = joined.text.length;
-            if (pageIndex === startPage && startHeading) {
-                const headingAt = this.findHeading(joined.text, startHeading, 0);
-                if (headingAt >= 0)
-                    searchableStart = headingAt + startHeading.length;
+            if (pageIndex === startPage) {
+                const heading = startHeading ? this.findHeadingRange(joined.text, startHeading, 0) : undefined;
+                const anchor = firstReference ? this.findFirstReferenceAnchor(joined.text, firstReference) : -1;
+                // A heading can be spread over multiple PDF.js spans (e.g.
+                // 'R e f e r e n c e s'). Do not silently fall back to zero:
+                // that would paint the conclusion and acknowledgements.
+                // A validated first-entry prefix is stronger than any word
+                // "References" appearing earlier in body text. Never allow
+                // bibliography highlighting to start before that prefix.
+                if (anchor >= 0) searchableStart = anchor;
+                else if (heading) searchableStart = heading.end;
+                else if (startHeading) searchableStart = joined.text.length;
             }
-            if (pageIndex === endPage && endHeading) {
-                const headingAt = this.findHeading(joined.text, endHeading, searchableStart);
-                if (headingAt >= 0)
-                    searchableEnd = headingAt;
+            if (pageIndex === endPage) {
+                if (endHeading) {
+                    const heading = this.findHeadingRange(joined.text, endHeading, searchableStart);
+                    if (heading) searchableEnd = Math.min(searchableEnd, heading.start);
+                }
+                // Use real VISUAL lines as a second independent guard. A PDF
+                // may split "A" and the appendix title across text spans or
+                // omit the appendix from its outline. Never paint the prose
+                // following such a terminal section heading.
+                const lines = joined.lines || [];
+                for (let i = 0; i < lines.length; i++) {
+                    const line = joined.text.slice(lines[i].start, lines[i].end);
+                    const next = i + 1 < lines.length
+                        ? joined.text.slice(lines[i + 1].start, lines[i + 1].end) : "";
+                    if (lines[i].start < searchableStart) continue;
+                    const following = lines.slice(i + 2, i + 7).map(value =>
+                        joined.text.slice(value.start, value.end));
+                    if ((0, PdfSectionExtractor_1.isBibliographyStopHeading)(line, next, following)) {
+                        searchableEnd = Math.min(searchableEnd, lines[i].start);
+                        break;
+                    }
+                }
             }
             searchableEnd = Math.min(searchableEnd, this.findReferenceEnd(joined.text, searchableStart));
             const searchableText = joined.text.slice(searchableStart, searchableEnd);
             this.pages.push({
                 page,
                 pageIndex,
-                spans,
+                spans: joined.spans,
+                lines: joined.lines,
                 text: joined.text,
                 offsets: joined.offsets,
                 searchableStart,
@@ -2132,11 +2195,26 @@ class ReferenceOverlay {
             const markers = findIndexedReferenceMarkers(page.text).filter(marker => marker.start >= page.searchableStart && marker.start < page.searchableEnd);
             // If layout extraction produces duplicate numeric markers, prefer
             // the actual bracketed bibliography label over inline numbers.
-            const markerIndex = markers.findIndex(marker => marker.index === index && marker.explicit)
-                >= 0 ? markers.findIndex(marker => marker.index === index && marker.explicit)
-                     : markers.findIndex(marker => marker.index === index);
-            if (markerIndex < 0)
-                continue;
+            const sourcePrefix = raw ? this.compactText(raw.replaceAll("\u0001", "")).text.slice(0, 28) : "";
+            // Do not accept "30." somewhere in prose as bibliography [30].
+            // An explicit label must still be followed by this entry's author.
+            const validMarker = marker => {
+                if (marker.index !== index) return false;
+                if (!marker.explicit && page.lines?.length) {
+                    const atStart = page.lines.some(line => marker.start >= line.start && marker.start - line.start < 4);
+                    if (!atStart) return false;
+                }
+                if (!sourcePrefix) return marker.explicit;
+                const excerpt = page.text.slice(marker.start, Math.min(page.searchableEnd, marker.start + 400));
+                const candidate = this.compactText(excerpt).text;
+                const withoutMarker = this.compactText(excerpt.replace(/^\s*(?:\[\s*\d{1,4}\s*\]|\(\s*\d{1,4}\s*\)|\d{1,4}[.)])\s*/u, "")).text;
+                return [candidate, withoutMarker].some(value => value.startsWith(sourcePrefix) ||
+                    (sourcePrefix.length >= 18 && value.startsWith(sourcePrefix.slice(0, 18))));
+            };
+            const markerIndex = markers.findIndex(marker => marker.explicit && validMarker(marker)) >= 0
+                ? markers.findIndex(marker => marker.explicit && validMarker(marker))
+                : markers.findIndex(validMarker);
+            if (markerIndex < 0) continue;
             const start = markers[markerIndex].start;
             let end = Math.min(markers[markerIndex + 1]?.start ?? page.searchableEnd, page.searchableEnd);
             // The END of a bibliography item is NOT its last year. Many citation
@@ -2432,58 +2510,7 @@ class ReferenceOverlay {
     }
     destroy() {
         this.clear();
-        this.doc.removeEventListener("click", this.clickHandler, true);
         this.doc.getElementById(ReferenceOverlay.styleID)?.remove();
-    }
-    showMenu(anchor, citation) {
-        this.closeMenu();
-        const menu = this.doc.createElement("div");
-        menu.className = "reference-linker-menu";
-        menu.setAttribute("role", "menu");
-        for (const action of unmatchedReferenceActions(citation)) {
-            const button = this.doc.createElement("button");
-            button.type = "button";
-            button.textContent = action.label;
-            button.setAttribute("role", "menuitem");
-            button.addEventListener("click", event => {
-                event.preventDefault();
-                event.stopPropagation();
-                if (action.kind === "open") {
-                    this.onOpenURL(action.value);
-                    this.closeMenu();
-                }
-                else {
-                    const copying = this.onCopyText ? this.onCopyText(action.value) : this.copyText(action.value);
-                    void Promise.resolve(copying).then(() => this.closeMenu(), () => this.closeMenu());
-                }
-            });
-            menu.append(button);
-        }
-        (this.doc.body || this.doc.documentElement).append(menu);
-        const anchorRect = anchor.getBoundingClientRect();
-        const menuRect = menu.getBoundingClientRect();
-        const width = this.doc.documentElement.clientWidth;
-        const height = this.doc.documentElement.clientHeight;
-        menu.style.left = `${Math.max(8, Math.min(anchorRect.left, width - menuRect.width - 8))}px`;
-        menu.style.top = `${Math.max(8, Math.min(anchorRect.bottom + 4, height - menuRect.height - 8))}px`;
-        this.menu = menu;
-    }
-    closeMenu() {
-        this.menu?.remove();
-        this.menu = undefined;
-    }
-    copyText(text) {
-        const clipboard = this.doc.defaultView?.navigator.clipboard;
-        if (clipboard)
-            return clipboard.writeText(text);
-        const textarea = this.doc.createElement("textarea");
-        textarea.value = text;
-        textarea.style.position = "fixed";
-        textarea.style.opacity = "0";
-        (this.doc.body || this.doc.documentElement).append(textarea);
-        textarea.select();
-        this.doc.execCommand("copy");
-        textarea.remove();
     }
     installStyle() {
         if (this.doc.getElementById(ReferenceOverlay.styleID))
@@ -2491,34 +2518,126 @@ class ReferenceOverlay {
         const style = this.doc.createElement("style");
         style.id = ReferenceOverlay.styleID;
         style.textContent = `
-      .reference-linker-region { position: absolute; z-index: 9; box-sizing: border-box; border-radius: 2px; }
-      .reference-linker-hit { background: rgba(255, 225, 90, .17) !important; cursor: pointer; }
+      .reference-linker-region { position: absolute; z-index: 9; box-sizing: border-box; border-radius: 2px; pointer-events: none !important; cursor: auto !important; }
+      .reference-linker-hit { background: rgba(255, 225, 90, .17) !important; }
       .reference-linker-unmatched { background: rgba(140, 146, 154, .14) !important; }
-      .reference-linker-actionable { cursor: pointer; }
-      .reference-linker-badge { position: absolute; z-index: 50; border: 1px solid rgba(90,70,0,.35); border-radius: 4px; padding: 1px 5px; background: #fff3a6; color: #342b00; font: 600 10px/16px system-ui, sans-serif; cursor: pointer; box-shadow: 0 1px 2px rgba(0,0,0,.2); }
+      .reference-linker-badge { position: absolute; z-index: 50; border: 1px solid rgba(90,70,0,.35); border-radius: 4px; padding: 1px 5px; background: #fff3a6; color: #342b00; font: 600 10px/16px system-ui, sans-serif; cursor: pointer; pointer-events: auto; box-shadow: 0 1px 2px rgba(0,0,0,.2); }
       .reference-linker-badge:hover { background: #ffe35c; }
-      .reference-linker-menu { position: fixed; z-index: 100; display: flex; gap: 4px; padding: 5px; border: 1px solid rgba(0,0,0,.18); border-radius: 7px; background: rgba(255,255,255,.97); box-shadow: 0 3px 12px rgba(0,0,0,.22); }
-      .reference-linker-menu button { border: 0; border-radius: 4px; padding: 4px 7px; background: transparent; color: #222; font: 600 11px/16px system-ui, sans-serif; white-space: nowrap; cursor: pointer; }
-      .reference-linker-menu button:hover { background: rgba(0,0,0,.08); }
     `;
         (this.doc.head || this.doc.documentElement).append(style);
     }
-    joinSpans(spans) {
+    joinSpans(spans, page) {
+        // PDF.js DOM order is not guaranteed to be visual reading order. In
+        // particular, line fragments may be inserted after reference numbers
+        // or after text belonging to the preceding section. Build an explicit
+        // geometric reading order for single-column pages, retaining the DOM
+        // order when the document has genuine side-by-side text columns.
+        let ordered = Array.from(spans);
+        let spatial = false;
+        if (page?.getBoundingClientRect && ordered.length > 2) {
+            const parent = page.getBoundingClientRect();
+            const rects = ordered.map((span, i) => {
+                const r = span.getBoundingClientRect?.();
+                return { span, i, left: r?.left - parent.left, top: r?.top - parent.top,
+                    right: r?.right - parent.left, width: r?.width, height: r?.height,
+                    baseline: r?.top + (r?.height || 0) * .78 - parent.top };
+            });
+            const valid = rects.filter(r => Number.isFinite(r.top) && Number.isFinite(r.left) &&
+                Number.isFinite(r.height) && r.height > 0 && Number.isFinite(r.width) && r.width > 0);
+            if (valid.length >= ordered.length * .9 && parent.width > 0) {
+                // In true two-column pages, both half-page-wide blocks share
+                // several baselines. A narrow numerical/alphanumeric label
+                // gutter cannot satisfy these width constraints.
+                let facing = 0;
+                for (const a of valid) {
+                    if (a.left > parent.width * .43 || a.width < parent.width * .18 || a.width > parent.width * .58) continue;
+                    if (valid.some(b => b !== a && b.left > parent.width * .50 &&
+                        b.width >= parent.width * .18 && b.width < parent.width * .58 &&
+                        Math.abs(a.baseline - b.baseline) <= Math.max(4, a.height * .40))) facing++;
+                    if (facing >= 5) break;
+                }
+                if (facing < 5) {
+                    spatial = true;
+                    valid.sort((a, b) => a.baseline - b.baseline || a.left - b.left);
+                    const rows = [];
+                    for (const item of valid) {
+                        const last = rows.at(-1);
+                        if (last && Math.abs(item.baseline - last.baseline) <= Math.max(2.4, Math.min(5, item.height * .30))) {
+                            last.items.push(item);
+                            last.baseline = (last.baseline * (last.items.length - 1) + item.baseline) / last.items.length;
+                        } else rows.push({ baseline: item.baseline, items: [item] });
+                    }
+                    ordered = rows.flatMap(row => row.items.sort((a,b) => a.left - b.left).map(item => item.span));
+                }
+            }
+        }
         let text = "";
         const offsets = [];
-        for (const span of spans) {
-            if (text)
-                text += " ";
+        const lines = [];
+        let prevBaseline;
+        for (const span of ordered) {
+            const rect = span.getBoundingClientRect?.();
+            const baseline = rect?.top != null && rect?.height > 0 ? rect.top + rect.height * .78 : undefined;
+            const newLine = prevBaseline == null || baseline == null || Math.abs(baseline - prevBaseline) > Math.max(3, (rect?.height || 10) * .4);
+            if (text) text += " ";
+            if (newLine || !lines.length) lines.push({ start: text.length, end: 0, top: rect?.top, spans: [] });
             const start = text.length;
             text += span.textContent || "";
             offsets.push({ start, end: text.length });
+            lines.at(-1).end = text.length;
+            lines.at(-1).spans.push(span);
+            if (baseline != null) prevBaseline = baseline;
         }
-        return { text, offsets };
+        return { text, offsets, lines, spans: ordered, spatial };
     }
     findHeading(text, heading, from) {
-        const words = heading.trim().split(/\s+/).map(word => word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
-        const match = new RegExp(words.join("\\s+"), "i").exec(text.slice(from));
-        return match ? from + match.index : -1;
+        return this.findHeadingRange(text, heading, from)?.start ?? -1;
+    }
+    findHeadingRange(text, heading, from = 0) {
+        const literal = heading.trim().split(/\s+/)
+            .map(word => word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+        const match = new RegExp(literal.join("\\s+"), "iu").exec(text.slice(from));
+        if (match) return { start: from + match.index, end: from + match.index + match[0].length };
+        // Some PDF text layers separate each glyph. Compare alphanumeric
+        // characters while preserving offsets to the original text layer.
+        const normalized = this.compactText(text.slice(from));
+        const needle = this.compactText(heading).text;
+        if (needle.length < 5) return undefined;
+        let pos = normalized.text.indexOf(needle);
+        while (pos >= 0) {
+            const start = from + normalized.offsets[pos];
+            const end = from + normalized.offsets[pos + needle.length - 1] + 1;
+            const left = start ? text[start - 1] : "";
+            const right = text[end] || "";
+            // Avoid matching the word inside a longer word or URL.
+            if (!/[\p{L}\p{N}]/u.test(left) && !/[\p{L}\p{N}]/u.test(right))
+                return { start, end };
+            pos = normalized.text.indexOf(needle, pos + 1);
+        }
+        return undefined;
+    }
+    findFirstReferenceAnchor(text, reference) {
+        // Enforce the true section boundary using the first full entry. This
+        // also works when the printed heading has an unusual font encoding.
+        const target = this.compactText((reference.raw || "").replaceAll("\u0001", "")).text;
+        if (target.length < 22) return -1;
+        const page = this.compactText(text);
+        for (const length of [60, 44, 30, 22]) {
+            if (target.length < length) continue;
+            const at = page.text.indexOf(target.slice(0, length));
+            if (at >= 0) {
+                let offset = page.offsets[at];
+                if (/^\s*[\[(]/u.test(reference.raw || "")) {
+                    // The compact match begins at the label text ("1"),
+                    // but the true anchor must include its opening bracket.
+                    const lead = text.slice(Math.max(0, offset - 6), offset);
+                    const opener = lead.match(/[\[(]\s*$/u);
+                    if (opener) offset -= opener[0].length;
+                }
+                return offset;
+            }
+        }
+        return -1;
     }
     compactText(value) {
         let text = "";
